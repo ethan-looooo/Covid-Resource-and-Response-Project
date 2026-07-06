@@ -1,0 +1,659 @@
+---
+title: "What Helped and What Hurt: Country-Level Drivers of COVID-19 Outcomes"
+subtitle: "STA 141A Final Project, Team #__"
+author: "Brian Hoang, [Member 2], [Member 3], [Member 4]"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    code-fold: false
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+  echo: true   # KEEP TRUE so code appears inline next to output (rubric requirement)
+               # Use find-and-replace to toggle echo: true / echo: false when checking page count
+---
+
+```{r setup}
+# Run this line once to install all packages needed for this project:
+# install.packages(c("tidyverse","skimr","naniar","corrplot","cluster",
+#                    "factoextra","janitor","scales","car","gridExtra","broom"))
+
+library(tidyverse)
+library(skimr)
+library(naniar)
+library(corrplot)
+library(cluster)
+library(factoextra)
+library(janitor)
+library(scales)
+library(car)
+library(gridExtra)
+library(broom)
+
+# Global plot theme applied to every ggplot in this report
+theme_set(theme_classic(base_size = 12))
+
+# Set seed for reproducibility of k-means and train/test split
+set.seed(141)
+
+# Shared color palette used across all visuals for a consistent look
+PALETTE <- c(
+  "#2166AC", "#B2182B", "#1A9641", "#762A83",
+  "#F4A582", "#4DAC26", "#FDAE61", "#5E3C99",
+  "#35978F"
+)
+```
+
+---
+
+# Executive Summary
+
+
+COVID-19 produced dramatically different outcomes across countries despite being caused by the same virus. This project uses the Our World in Data COVID-19 dataset with data through December 2022, to understand which country-level factors drove those differences. We apply multiple linear regression to model mortality as a function of country resources, logistic regression to classify countries as high- or low-burden, and k-means clustering to identify distinct pandemic profiles.
+
+
+---
+
+# 1. Introduction
+
+
+
+COVID-19 took the world by storm. It caused global lockdowns and slowed many economies to a crawl. It is one of the greatest natural disasters our generation has faced. Now that we have largely moved past it, we want to look back and understand what actually made a difference in how countries fared.
+
+Not every country got hit the same way. Some countries with strong healthcare systems still ended up with staggering death tolls. Others with far fewer resources came out relatively unscathed. Two themes drive our analysis. The first is resources, meaning what a country already had in place before the pandemic hit. The second is response, meaning what a country actively chose to do once it arrived.
+
+We use the Our World in Data (OWID) COVID-19 dataset to explore these themes. Our World in Data consolidates data from governments and the WHO into one clean, well-documented file. The dataset covers case counts, deaths, hospitalizations, vaccinations, testing, government policy responses, and country-level characteristics like demographics and GDP.
+
+Our three research questions are:
+
+1. Do a country's resources predict how badly it got hit by COVID-19? (Multiple linear regression)
+2. What separates hard-hit countries from low-burden ones? (Logistic regression and group comparison)
+3. Are there distinct pandemic profiles among countries, and do they align with continent or income level? (K-means clustering)
+
+---
+
+# 2. Data
+
+
+## 2.1 Source and loading
+
+```{r load}
+# Source: Our World in Data COVID-19 dataset
+# https://github.com/owid/covid-19-data
+raw <- read_csv("owid-covid-data.csv", show_col_types = FALSE)
+
+# Confirm dimensions: should be ~429,000 rows and 67 columns
+dim(raw)
+```
+
+## 2.2 Data wrangling and country-level snapshot
+
+
+
+```{r clean}
+# Filter out OWID aggregate rows (not real countries)
+covid <- raw |>
+  filter(!is.na(continent), !str_starts(iso_code, "OWID_")) |>
+  mutate(date = as.Date(date)) |>
+  arrange(location, date)
+
+# Collapse daily panel to one row per country at end-of-2022 snapshot
+snapshot_date <- as.Date("2022-12-31")
+
+country_xs <- covid |>
+  filter(date <= snapshot_date) |>
+  group_by(location, iso_code, continent) |>
+  summarize(
+    # Outcomes
+    total_deaths_per_million    = max(total_deaths_per_million,                        na.rm = TRUE),
+    excess_mort_cum_per_million = suppressWarnings(max(excess_mortality_cumulative_per_million, na.rm = TRUE)),
+    # Response variables
+    fully_vacc_per_hundred      = suppressWarnings(max(people_fully_vaccinated_per_hundred,     na.rm = TRUE)),
+    boosters_per_hundred        = suppressWarnings(max(total_boosters_per_hundred,              na.rm = TRUE)),
+    peak_stringency             = suppressWarnings(max(stringency_index,                        na.rm = TRUE)),
+    total_tests_per_thousand    = suppressWarnings(max(total_tests_per_thousand,                na.rm = TRUE)),
+    # Resource variables (constant per country, mean is robust to NAs)
+    hospital_beds_per_thousand  = mean(hospital_beds_per_thousand,  na.rm = TRUE),
+    gdp_per_capita              = mean(gdp_per_capita,              na.rm = TRUE),
+    human_development_index     = mean(human_development_index,     na.rm = TRUE),
+    median_age                  = mean(median_age,                  na.rm = TRUE),
+    aged_65_older               = mean(aged_65_older,               na.rm = TRUE),
+    cardiovasc_death_rate       = mean(cardiovasc_death_rate,       na.rm = TRUE),
+    diabetes_prevalence         = mean(diabetes_prevalence,         na.rm = TRUE),
+    population_density          = mean(population_density,          na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  # Replace -Inf values (from max() on all-NA groups) with NA
+  mutate(across(where(is.numeric), ~ ifelse(is.infinite(.x), NA, .x)))
+
+# Final snapshot dimensions: should be 237 countries x 17 columns
+dim(country_xs)
+```
+
+## 2.3 Summary statistics
+
+
+
+```{r skim}
+# Summary statistics for all numeric variables in the country-level snapshot
+# This satisfies the rubric's "summary statistics" EDA requirement
+skim(country_xs |> select(-iso_code))
+```
+
+## 2.4 Missingness
+
+
+```{r missingness, fig.width=8, fig.height=4.5}
+# Horizontal bar chart showing % missing per variable, sorted from most to least missing
+country_xs |>
+  select(-location, -iso_code, -continent) |>
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") |>
+  mutate(
+    variable = case_match(variable,
+      "total_deaths_per_million"    ~ "Deaths per million",
+      "excess_mort_cum_per_million" ~ "Excess mortality",
+      "fully_vacc_per_hundred"      ~ "Full vaccination %",
+      "boosters_per_hundred"        ~ "Boosters %",
+      "peak_stringency"             ~ "Peak stringency",
+      "total_tests_per_thousand"    ~ "Tests per 1K",
+      "hospital_beds_per_thousand"  ~ "Hospital beds/1K",
+      "gdp_per_capita"              ~ "GDP per capita",
+      "human_development_index"     ~ "Human dev. index",
+      "median_age"                  ~ "Median age",
+      "aged_65_older"               ~ "Age 65+",
+      "cardiovasc_death_rate"       ~ "Cardiovasc. death rate",
+      "diabetes_prevalence"         ~ "Diabetes prevalence",
+      "population_density"          ~ "Population density"
+    ),
+    variable = reorder(variable, pct_missing)
+  ) |>
+  ggplot(aes(pct_missing, variable, fill = pct_missing)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = paste0(round(pct_missing, 1), "%")),
+            hjust = -0.15, size = 3.2) +
+  scale_fill_gradient(low = "#C6DBEF", high = PALETTE[1]) +
+  scale_x_continuous(limits = c(0, 60), labels = function(x) paste0(x, "%")) +
+  labs(title = "Percentage of missing values by variable", x = "% Missing", y = NULL) +
+  theme(plot.title = element_text(face = "bold", size = 13), legend.position = "none")
+```
+
+## 2.5 Outcome distribution
+
+
+
+```{r outcome-hist, fig.width=7, fig.height=4}
+country_xs |>
+  ggplot(aes(total_deaths_per_million)) +
+  geom_histogram(bins = 30, fill = PALETTE[1], color = "white", alpha = 0.85) +
+  scale_x_continuous(labels = comma) +
+  labs(
+    title = "Cumulative COVID-19 deaths per million (end of 2022)",
+    x     = "Deaths per million",
+    y     = "Number of countries"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 13))
+```
+
+## 2.6 Correlation heatmap
+
+
+```{r corrplot, fig.width=7.5, fig.height=6.5}
+cor_data <- country_xs |>
+  select(
+    "Deaths/M"    = total_deaths_per_million,
+    "Median Age"  = median_age,
+    "GDP/Cap"     = gdp_per_capita,
+    "Hosp. Beds"  = hospital_beds_per_thousand,
+    "Full Vacc."  = fully_vacc_per_hundred,
+    "Stringency"  = peak_stringency,
+    "Cardio Rate" = cardiovasc_death_rate,
+    "Diabetes"    = diabetes_prevalence,
+    "HDI"         = human_development_index
+  ) |>
+  drop_na()
+
+corrplot(
+  cor(cor_data),
+  method      = "color",
+  type        = "upper",
+  tl.cex      = 0.85,
+  tl.col      = "black",
+  tl.srt      = 45,
+  addCoef.col = "black",
+  number.cex  = 0.72,
+  col         = colorRampPalette(c("#67001F", "white", "#2166AC"))(200),
+  title       = "Correlation matrix of key variables",
+  mar         = c(0, 0, 2, 0)
+)
+```
+
+## 2.7 Key bivariate relationships
+
+
+
+```{r scatter-age, fig.width=6, fig.height=4}
+country_xs |>
+  drop_na(median_age, total_deaths_per_million) |>
+  ggplot(aes(median_age, total_deaths_per_million)) +
+  geom_point(color = PALETTE[1], alpha = 0.65, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = PALETTE[2], linewidth = 0.9) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Older populations faced higher mortality",
+       x = "Median age", y = "Deaths per million") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+```
+
+```{r scatter-gdp, fig.width=6, fig.height=4}
+country_xs |>
+  drop_na(gdp_per_capita, total_deaths_per_million) |>
+  ggplot(aes(gdp_per_capita, total_deaths_per_million)) +
+  geom_point(color = PALETTE[3], alpha = 0.65, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = PALETTE[2], linewidth = 0.9) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Wealthier countries did not necessarily fare better",
+       x = "GDP per capita (USD)", y = "Deaths per million") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+```
+
+```{r scatter-vacc, fig.width=6, fig.height=4}
+country_xs |>
+  drop_na(fully_vacc_per_hundred, total_deaths_per_million) |>
+  ggplot(aes(fully_vacc_per_hundred, total_deaths_per_million)) +
+  geom_point(color = PALETTE[4], alpha = 0.65, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = PALETTE[2], linewidth = 0.9) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Full vaccination rate vs cumulative deaths per million",
+       x = "People fully vaccinated per 100", y = "Deaths per million") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+```
+
+---
+
+# 3. Methods
+
+We use three analytical approaches, one per research question. All three operate on the same country-level cross-sectional snapshot.
+
+**Q1: Multiple linear regression with standardized predictors.** We model log-transformed cumulative deaths per million as a function of country resource variables. The log transformation is necessary because raw mortality is heavily right-skewed. We standardize all predictors before fitting so that every coefficient is on a common, unit-free scale. This lets us directly compare effect sizes across variables with different units (beds per thousand vs. GDP per capita, etc.). We verify MLR assumptions using residual diagnostic plots and check multicollinearity using variance inflation factors (VIF). A VIF above 5 signals that predictors are too correlated for their individual effects to be reliably estimated.
+
+**Q2: Logistic regression with visual group comparison.** We define a binary outcome by labeling each country "High" burden if its deaths per million sits above the global median. We first compare the two groups visually using side-by-side boxplots to understand the raw differences. We then fit a logistic regression on a 70/30 train/test split. Logistic regression is a supervised classification technique from STA 141A that goes beyond the linear regression covered in STA 108. We evaluate the model using a confusion matrix and overall accuracy. HDI is excluded from this model because it is highly correlated with GDP, median age, and hospital beds, causing numerical instability in the logistic fit.
+
+**Q3: K-means clustering.** We cluster countries on standardized outcome and response variables (mortality, vaccination, stringency, and testing intensity) to identify distinct pandemic profiles. K-means is an unsupervised learning technique from STA 141A that does not require a predefined outcome variable. We choose the number of clusters using the elbow method and silhouette scores. We then describe each cluster and check whether the groupings align with continent or income level.
+
+---
+
+# 4. Q1: Do Country Resources Predict Mortality? (MLR)
+
+
+
+## 4.1 Model
+
+```{r mlr-data}
+# Prepare MLR dataset: log-transform outcome, standardize all predictors
+mlr_data <- country_xs |>
+  select(
+    total_deaths_per_million,
+    hospital_beds_per_thousand, gdp_per_capita, human_development_index,
+    median_age, aged_65_older, cardiovasc_death_rate, diabetes_prevalence,
+    population_density
+  ) |>
+  drop_na() |>
+  mutate(
+    log_dpm = log(total_deaths_per_million + 1),
+    across(-c(total_deaths_per_million, log_dpm), scale)
+  ) |>
+  select(-total_deaths_per_million)
+mlr_data2 <- mlr_data |>
+  select( -aged_65_older)
+
+cat("Countries used in MLR after dropping NAs:", nrow(mlr_data), "\n")
+```
+
+```{r mlr-fit}
+mlr <- lm(log_dpm ~ ., data = mlr_data)
+mlr2 <- lm(log_dpm ~ ., data = mlr_data2)
+summary(mlr)
+summary(mlr2)
+```
+
+## 4.2 Multicollinearity check
+
+```{r mlr-vif}
+# VIF values above 5 indicate problematic multicollinearity
+car::vif(mlr) |> sort(decreasing = TRUE)
+car::vif(mlr2) |> sort(decreasing = TRUE)
+```
+
+
+
+
+## 4.3 Diagnostic plots
+]
+```{r mlr-diagnostics, fig.width=10, fig.height=8}
+mlr_aug <- augment(mlr2)
+
+# Residuals vs Fitted: checks linearity assumption
+p1 <- ggplot(mlr_aug, aes(.fitted, .resid)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(color = PALETTE[1], alpha = 0.6, size = 1.8) +
+  geom_smooth(method = "loess", se = FALSE, color = PALETTE[2], linewidth = 0.8) +
+  labs(title = "Residuals vs Fitted", x = "Fitted values", y = "Residuals") +
+  theme(plot.title = element_text(face = "bold"))
+
+# Q-Q plot: checks normality of residuals
+p2 <- ggplot(mlr_aug, aes(sample = .std.resid)) +
+  stat_qq(color = PALETTE[3], alpha = 0.65, size = 1.8) +
+  stat_qq_line(color = PALETTE[2], linewidth = 0.8, linetype = "dashed") +
+  labs(title = "Q-Q Residuals", x = "Theoretical quantiles", y = "Standardized residuals") +
+  theme(plot.title = element_text(face = "bold"))
+
+# Scale-Location: checks equal variance assumption
+p3 <- ggplot(mlr_aug, aes(.fitted, sqrt(abs(.std.resid)))) +
+  geom_point(color = PALETTE[4], alpha = 0.6, size = 1.8) +
+  geom_smooth(method = "loess", se = FALSE, color = PALETTE[2], linewidth = 0.8) +
+  labs(title = "Scale-Location", x = "Fitted values", y = "\u221A|Standardized residuals|") +
+  theme(plot.title = element_text(face = "bold"))
+
+# Residuals vs Leverage: identifies influential observations
+p4 <- ggplot(mlr_aug, aes(.hat, .std.resid)) +
+  geom_point(color = PALETTE[5], alpha = 0.6, size = 1.8) +
+  geom_smooth(method = "loess", se = FALSE, color = PALETTE[2], linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(title = "Residuals vs Leverage", x = "Leverage", y = "Standardized residuals") +
+  theme(plot.title = element_text(face = "bold"))
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+
+## 4.4 Coefficient plot
+
+```{r mlr-coef-plot, fig.width=7, fig.height=5}
+mlr_terms <- tidy(mlr2, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    label = case_match(term,
+      "hospital_beds_per_thousand" ~ "Hospital beds/1K",
+      "gdp_per_capita"             ~ "GDP per capita",
+      "human_development_index"    ~ "Human dev. index",
+      "median_age"                 ~ "Median age",
+      "aged_65_older"              ~ "Age 65+",
+      "cardiovasc_death_rate"      ~ "Cardiovasc. death rate",
+      "diabetes_prevalence"        ~ "Diabetes prevalence",
+      "population_density"         ~ "Population density"
+    ),
+    label = reorder(label, estimate)
+  )
+
+ggplot(mlr_terms, aes(estimate, label, color = label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.3, show.legend = FALSE) +
+  geom_point(size = 3.5, show.legend = FALSE) +
+  scale_color_manual(values = PALETTE) +
+  labs(
+    title    = "Which resources predict higher COVID-19 mortality?",
+    subtitle = "Standardized coefficients: one unit = one standard deviation increase",
+    x        = "Coefficient estimate (with 95% CI)",
+    y        = NULL
+  ) +
+  theme(plot.title    = element_text(face = "bold", size = 12),
+        plot.subtitle = element_text(size = 10, color = "grey40"))
+```
+
+
+
+# 5. Q2: What Separates High-Burden from Low-Burden Countries? (Logistic Regression)
+
+
+
+## 5.1 Creating the outcome variable
+
+```{r class-data}
+class_data <- country_xs |>
+  select(
+    total_deaths_per_million,
+    hospital_beds_per_thousand, gdp_per_capita,
+    median_age, cardiovasc_death_rate, diabetes_prevalence,
+    fully_vacc_per_hundred, peak_stringency, total_tests_per_thousand
+  ) |>
+  drop_na() |>
+  mutate(high_burden = factor(if_else(
+    total_deaths_per_million > median(total_deaths_per_million), "High", "Low"
+  ))) |>
+  select(-total_deaths_per_million)
+
+# Check balance of the two classes
+table(class_data$high_burden)
+```
+
+
+## 5.2 Group comparison: what separates the two groups visually?
+
+```{r group-compare, fig.width=9, fig.height=6}
+class_data |>
+  select(high_burden, median_age, gdp_per_capita,
+         fully_vacc_per_hundred, hospital_beds_per_thousand,
+         peak_stringency, cardiovasc_death_rate) |>
+  pivot_longer(-high_burden, names_to = "variable", values_to = "value") |>
+  mutate(variable = case_match(variable,
+    "median_age"                 ~ "Median age",
+    "gdp_per_capita"             ~ "GDP per capita",
+    "fully_vacc_per_hundred"     ~ "Full vaccination %",
+    "hospital_beds_per_thousand" ~ "Hospital beds/1K",
+    "peak_stringency"            ~ "Peak stringency",
+    "cardiovasc_death_rate"      ~ "Cardiovasc. death rate"
+  )) |>
+  ggplot(aes(high_burden, value, fill = high_burden)) +
+  geom_boxplot(alpha = 0.75, outlier.alpha = 0.4, outlier.size = 1.5) +
+  scale_fill_manual(values = c("High" = PALETTE[2], "Low" = PALETTE[1])) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 3) +
+  labs(title = "Key variable distributions by pandemic burden group",
+       x = "Burden group", y = NULL, fill = "Burden") +
+  theme(
+    plot.title      = element_text(face = "bold", size = 13),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "none"
+  )
+```
+
+## 5.3 Train/test split
+
+```{r class-split}
+# 70% training, 30% test — standard split for this sample size
+n         <- nrow(class_data)
+train_idx <- sample(seq_len(n), size = floor(0.7 * n))
+train     <- class_data[train_idx, ]
+test      <- class_data[-train_idx, ]
+
+cat("Training set:", nrow(train), "countries\n")
+cat("Test set:    ", nrow(test),  "countries\n")
+```
+
+## 5.4 Logistic regression
+
+```{r logit-fit}
+# HDI is excluded because it is highly collinear with GDP, median age,
+# and hospital beds, causing numerical instability in the logistic fit
+logit <- glm(high_burden ~ ., data = train, family = binomial)
+summary(logit)
+```
+
+
+
+## 5.5 Model evaluation
+
+```{r logit-eval}
+logit_pred  <- predict(logit, newdata = test, type = "response")
+logit_class <- factor(if_else(logit_pred > 0.5, "High", "Low"), levels = c("High", "Low"))
+
+cat("Confusion matrix:\n")
+print(table(predicted = logit_class, actual = test$high_burden))
+cat("\nAccuracy:", round(mean(logit_class == test$high_burden), 3), "\n")
+```
+
+
+
+## 5.6 Coefficient plot
+
+```{r logit-coef-plot, fig.width=7, fig.height=5}
+logit_terms <- tidy(logit, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    label = case_match(term,
+      "hospital_beds_per_thousand" ~ "Hospital beds/1K",
+      "gdp_per_capita"             ~ "GDP per capita",
+      "median_age"                 ~ "Median age",
+      "cardiovasc_death_rate"      ~ "Cardiovasc. death rate",
+      "diabetes_prevalence"        ~ "Diabetes prevalence",
+      "fully_vacc_per_hundred"     ~ "Full vaccination %",
+      "peak_stringency"            ~ "Peak stringency",
+      "total_tests_per_thousand"   ~ "Tests per 1K"
+    ),
+    label = reorder(label, estimate)
+  )
+
+ggplot(logit_terms, aes(estimate, label, color = label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.3, show.legend = FALSE) +
+  geom_point(size = 3.5, show.legend = FALSE) +
+  scale_color_manual(values = PALETTE) +
+  labs(
+    title = "Logistic regression: which factors drive high pandemic burden?",
+    x     = "Log-odds coefficient (with 95% CI)",
+    y     = NULL
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 12))
+```
+
+
+
+# 6. Q3: Are There Distinct Pandemic Profiles? (K-Means Clustering)
+
+
+
+## 6.1 Feature preparation
+
+```{r cluster-prep}
+# Select and standardize clustering features
+# Standardizing puts all variables on the same scale so no single
+# variable dominates the distance calculations
+cluster_features <- country_xs |>
+  select(location, continent,
+         total_deaths_per_million, fully_vacc_per_hundred,
+         peak_stringency, total_tests_per_thousand,
+         median_age, gdp_per_capita) |>
+  drop_na()
+
+X_clust <- cluster_features |>
+  select(-location, -continent) |>
+  scale()
+
+cat("Countries included in clustering:", nrow(cluster_features), "\n")
+```
+
+## 6.2 Choosing the number of clusters
+
+```{r k-selection, fig.width=10, fig.height=4}
+# Elbow method: look for the bend where adding clusters stops helping much
+p_elbow <- fviz_nbclust(X_clust, kmeans, method = "wss") +
+  theme_classic(base_size = 11) +
+  labs(title = "Elbow method") +
+  theme(plot.title = element_text(face = "bold"))
+
+# Silhouette method: higher is better, pick the k with the tallest bar
+p_silh <- fviz_nbclust(X_clust, kmeans, method = "silhouette") +
+  theme_classic(base_size = 11) +
+  labs(title = "Silhouette method") +
+  theme(plot.title = element_text(face = "bold"))
+
+grid.arrange(p_elbow, p_silh, ncol = 2)
+```
+
+
+
+## 6.3 K-means fit
+
+```{r kmeans, fig.width=8, fig.height=6}
+# Set k based on the diagnostic plots above (3 or 4 is typical)
+k  <- 4
+km <- kmeans(X_clust, centers = k, nstart = 25)
+
+cluster_features <- cluster_features |>
+  mutate(cluster = factor(km$cluster))
+
+# Cluster scatter plot (axes are principal components for visualization)
+fviz_cluster(km, data = X_clust,
+             geom         = "point",
+             ellipse.type = "convex",
+             palette      = PALETTE[1:k],
+             ggtheme      = theme_classic(base_size = 11)) +
+  labs(title = paste("K-means clustering of countries, k =", k)) +
+  theme(plot.title = element_text(face = "bold", size = 13))
+```
+
+
+
+## 6.4 Cluster profile table
+
+```{r cluster-centroids}
+# Average values for each variable within each cluster
+# Use this table to name and describe each cluster
+cluster_features |>
+  group_by(cluster) |>
+  summarize(
+    n                  = n(),
+    deaths_per_million = round(mean(total_deaths_per_million, na.rm = TRUE)),
+    full_vacc_pct      = round(mean(fully_vacc_per_hundred,   na.rm = TRUE), 1),
+    peak_stringency    = round(mean(peak_stringency,          na.rm = TRUE), 1),
+    tests_per_thousand = round(mean(total_tests_per_thousand, na.rm = TRUE), 1),
+    median_age         = round(mean(median_age,               na.rm = TRUE), 1),
+    gdp_per_capita     = round(mean(gdp_per_capita,           na.rm = TRUE))
+  )
+```
+
+## 6.5 Cluster profile bar chart
+
+```{r cluster-bars, fig.width=9, fig.height=5}
+cluster_features |>
+  group_by(cluster) |>
+  summarize(
+    `Deaths per million` = mean(total_deaths_per_million, na.rm = TRUE),
+    `Full vaccination %` = mean(fully_vacc_per_hundred,   na.rm = TRUE),
+    `Peak stringency`    = mean(peak_stringency,          na.rm = TRUE),
+    `Tests per 1K`       = mean(total_tests_per_thousand, na.rm = TRUE)
+  ) |>
+  pivot_longer(-cluster, names_to = "metric", values_to = "value") |>
+  ggplot(aes(cluster, value, fill = cluster)) +
+  geom_col(alpha = 0.85) +
+  scale_fill_manual(values = PALETTE[1:k]) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+  labs(title = "Average profile of each cluster", x = "Cluster", y = NULL) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 13),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "none"
+  )
+```
+
+## 6.6 Do clusters align with continent?
+
+```{r cluster-continent}
+# Cross-tab of cluster assignment vs continent
+janitor::tabyl(cluster_features, continent, cluster) |>
+  janitor::adorn_totals(c("row", "col"))
+```
+
+
+
+# References
+
+- Mathieu, E. et al. (2021). A global database of COVID-19 vaccinations. *Nature Human Behaviour.*
+- Hale, T. et al. (2021). A global panel database of pandemic policies (Oxford COVID-19 Government Response Tracker). *Nature Human Behaviour.*
+- Our World in Data COVID-19 dataset: https://github.com/owid/covid-19-data
