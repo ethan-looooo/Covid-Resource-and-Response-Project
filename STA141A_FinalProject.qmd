@@ -1,6 +1,5 @@
 ---
 title: "What Helped and What Hurt: Country-Level Drivers of COVID-19 Outcomes"
-subtitle: "STA 141A Final Project, Team #__"
 author: "Brian Hoang, Ethan Lo, Jinghan Sun, Keji Qin"
 date: "`r Sys.Date()`"
 format:
